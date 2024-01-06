@@ -1,0 +1,111 @@
+library(DBI)
+library(dplyr)
+library(dbplyr)
+library(odbc)
+
+
+con <- dbConnect(odbc(), "snowflake-moffitt", database = "MCAP_PROD", role = "SNOWFLAKE_HB", Warehouse = "SNOWFLAKE_HB_WH")
+
+pts <- tbl(con,in_schema ("DATACORE", "V_D_PATIENT"))
+
+cr <- tbl(con,in_schema ("DATACORE", "V_REGISTRY_GENERAL"))
+
+
+pk<- cr %>% filter(PRIMARY_SITE_GROUP_DESC == !!"PANCREAS" ) %>% collect() %>% select(!matches("ETL_"))
+# Filtering histolgies
+View(as.data.frame(table(pk$HISTOLOGY_DESC, pk$HISTOLOGY_CD)))
+
+pk.1<- pk %>% filter( HISTOLOGY_CD %in% c(81403, 85003, 84403, 82403, 80103, 84803, 84813, 85603, 80003, 81402, 80203, 84703, 82553))
+
+
+pk.pts<- pts %>% filter(PATIENT_ID %in% !!unique(pk.1$PATIENT_ID)) %>% collect() %>% select(!matches("ETL_"))
+
+map1$MRN<- as.character(trimws(map1$MRN, "both"))
+
+pk.pts.2<- pts %>% filter(MRN %in% !!unique(MRNs$MRN)) %>% collect() %>% select(!matches("ETL_"))
+
+pk.pts.3<- pk.pts %>% bind_rows(pk.pts.2) %>%  unique()
+
+save(pk.pts.3, file="Exports/PDCA_all_mfg_06072023.RData")
+
+
+pk.cr<- cr %>% filter(PATIENT_ID %in% !!unique(pk.pts.3$PATIENT_ID)) %>% collect() %>% select(!matches("ETL_"))
+pk.cr<- pk.cr %>% filter(PRIMARY_SITE_GROUP_DESC == "PANCREAS" & (grepl("C1|P1", STAGE_PATHOLOGICAL_TNM_M_DESC) | grepl("C1|P1", STAGE_CLINICAL_TNM_M_DESC) | 
+                                                                    grepl("M1",STAGE_TNM_CLIN_M_2018_CD)| grepl("M1",STAGE_TNM_PATH_M_2018_CD)))
+
+
+pk.pts.4<- pk.pts.3 %>% filter(PATIENT_ID %in% !!unique(pk.cr$PATIENT_ID))
+save(pk.pts.3, file="Exports/PDCA_all_mfg_06072023.RData")
+
+tx <- tbl(con,in_schema ("DATACORE", "V_REGISTRY_TREATMENT"))
+txs <- tbl(con,in_schema ("DATACORE", "V_REGISTRY_TREATMENT_SUMMARY"))
+
+pk.tx <- tx %>% filter(TUMOR_ID %in% !!unique(pk.cr$TUMOR_ID)) %>% collect()%>% select(!matches("ETL_"))
+pk.txs <- txs %>% filter(TUMOR_ID %in% !!unique(pk.cr$TUMOR_ID)) %>% collect()%>% select(!matches("ETL_"))
+
+pk.tx.2<- pk.tx %>% filter(!is.na(TREATMENT_START_DT) & !(TREATMENT_TYPE %in% c("DXSTG", "TRANSPLANT")) & !(TREATMENT_RX_SUMMARY_DESC %in% c("NONE, NOT PLANNED", "REFUSED") )) %>% 
+  arrange(PATIENT_ID, TREATMENT_START_DT, TREATMENT_ID)  
+
+pk.1s.tx<- pk.tx.2 %>% filter(TREATMENT_COURSE_DESC== "FIRST COURSE") %>% 
+  mutate(seq= ave(PATIENT_ID, PATIENT_ID, FUN=seq_along)) %>% filter( seq== 1)
+
+as.data.frame(table(pk.1s.tx$TREATMENT_TYPE, exclude = NULL))%>% arrange(-Freq)
+as.data.frame(table(pk.1s.tx$TREATMENT_RX_SUMMARY_DESC)) %>% arrange(-Freq)
+first.tx<- as.data.frame(table(pk.1s.tx$TREATMENT_DRUG_DESC)) %>% arrange(-Freq)
+write.csv(first.tx, file="Exports/PDAC_FIRST_TX.csv", na="", row.names = FALSE)
+
+pk.2s.tx<- pk.tx.2 %>%  filter(TREATMENT_COURSE_DESC== "NOT FIRST COURSE") %>% 
+  mutate(seq= ave(PATIENT_ID, PATIENT_ID, FUN=seq_along)) %>% filter(seq== 1)
+
+
+as.data.frame(table(pk.2s.tx$TREATMENT_TYPE, exclude = NULL))%>% arrange(-Freq)
+as.data.frame(table(pk.2s.tx$TREATMENT_RX_SUMMARY_DESC)) %>% arrange(-Freq)
+second.tx<- as.data.frame(table(pk.2s.tx$TREATMENT_DRUG_DESC)) %>% arrange(-Freq)
+write.csv(first.tx, file="Exports/PDAC_SECOND_TX.csv", na="", row.names = FALSE)
+
+### HE slide available
+
+pk.sx<- pk.tx %>% filter(TREATMENT_TYPE %in% c("SURG", "DXSTG") & !is.na(TREATMENT_START_DT))
+
+length(unique(pk.sx$PATIENT_ID))
+bb<- tbl(con,in_schema ("DATACORE", "V_BIOBANK_COLLECTION"))
+
+pk.bb<- bb %>% filter(PATIENT_ID %in% !!unique(pk.cr$PATIENT_ID)) %>%  collect() %>% select(!matches("ETL_"))
+
+table(pk.bb$SAMPLE_TYPE)
+
+pk.serum<- pk.bb %>%  filter(COLLECTION_SITE_TISSUE_TYPE_DESC== "Blood" & SAMPLE_TYPE== "Serum" & STORAGE_STATUS_TYPE== "In Circulation") %>% select(PATIENT_ID, SAMPLE_TYPE) %>% unique()
+
+pk.bb.t<- bb %>% filter(PATIENT_ID %in% !!unique(pk.cr$PATIENT_ID)) %>%  collect() %>% select(!matches("ETL_"))
+pk.tissue<- pk.bb.t %>%  filter(SAMPLE_TYPE %in% c("Macrodissected Tissue", "Unprocessed Solid Tissue", "Stained Slide", "FFPE Core") & 
+                                  COLLECTION_GROSS_DIAGNOSIS_DESC== "Tumor" & 
+                                  STORAGE_STATUS_TYPE== "In Circulation") %>% 
+  select(PATIENT_ID, SAMPLE_TYPE) %>% unique()
+pk.tissue$counts<- 1
+
+
+pk.biopsy<-pk.sx %>%  filter(TREATMENT_PROCEDURE_DESC %in% c("INCIS BX PRIMARY") & TREATMENT_TYPE %in% c("DXSTG"))
+
+library(reshape)
+pk.tissue.w<- reshape(data.frame(pk.tissue), idvar="PATIENT_ID", timevar = "SAMPLE_TYPE",  direction = "wide")
+names(pk.tissue.w)<- gsub("counts.", "", names(pk.tissue.w))
+
+## Datasets: 
+
+# Metastatic PDCA cases 
+
+pk.data <- pk.cr %>% select(PATIENT_ID, TUMOR_ID, DX_DT, HISTOLOGY_CD, HISTOLOGY_DESC, PRIMARY_SITE_DESC, 
+                            STAGE_TNM_CS_MIXED_GROUP_DESC, STAGE_CLINICAL_TNM_GROUP_DESC, STAGE_PATHOLOGICAL_TNM_GROUP_DESC, 
+                            STAGE_PATHOLOGICAL_TNM_M_DESC, STAGE_CLINICAL_TNM_M_DESC,STAGE_TNM_CLIN_M_2018_CD, STAGE_TNM_PATH_M_2018_CD) %>% unique() %>% 
+  left_join(pk.1s.tx %>% select(PATIENT_ID, TUMOR_ID, TREATMENT_TYPE, TREATMENT_START_DT, TREATMENT_RX_SUMMARY_DESC, TREATMENT_DRUG_DESC), by= c("PATIENT_ID", "TUMOR_ID")) %>% 
+  
+  left_join(pk.2s.tx %>% select(PATIENT_ID, TUMOR_ID, TREATMENT_TYPE, TREATMENT_START_DT, TREATMENT_RX_SUMMARY_DESC, TREATMENT_DRUG_DESC), by= c("PATIENT_ID", "TUMOR_ID")) %>% 
+  
+  
+  left_join(pk.sx %>% filter(TREATMENT_TYPE %in% c("SURG")) %>% mutate(SURGERY= "Yes") %>% select(PATIENT_ID, TUMOR_ID, SURGERY) %>%  unique(), by= c("PATIENT_ID", "TUMOR_ID")) %>% 
+  left_join(pk.biopsy %>% mutate(BIOPSY= "Yes") %>% select(PATIENT_ID, TUMOR_ID, BIOPSY) %>%  unique(), by= c("PATIENT_ID", "TUMOR_ID")) %>% 
+  left_join(pk.serum, by= "PATIENT_ID") %>% 
+  left_join(pk.tissue.w, by= "PATIENT_ID")
+
+
+save(pk.data, file="Exports/PDAC_METS_DATA_MFG_06072023.RData")
